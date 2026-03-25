@@ -1,0 +1,17 @@
+results_*.json
+sourcefinder-tool
+config.yaml
+sourcefinder-tool.*
+chatgpt-agent
+grok-agent
+# Added by goreleaser init:
+dist/
+inputs-demo.txt
+output*
+.ai
+PLAN.md
+
+GROK_BUTTON_FIX.md
+IMPROVEMENTS.md
+.claude/*
+MULTI_SITE_USAGE.md
