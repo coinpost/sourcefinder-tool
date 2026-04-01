@@ -861,15 +861,12 @@ func processBrowserTasks(cfg *config.Config, inputs []InputSource, template stri
 		// Wait for page to stabilize after selection
 		time.Sleep(500 * time.Millisecond)
 
-		// Create isolated ChromeDevTools instance for this page
-		cdtForPage := mcp.NewChromeDevTools(mcpClient)
-
 		// Input and submit only (will wait in parallel phase)
 		prompt := replaceTemplatePlaceholders(template, browserTasks[i].Input.Input)
 
 		// Create the appropriate agent based on site
 		if browserTasks[i].Site == "grok" {
-			agent := grok.NewAgent(cdtForPage, cfg.Timeout, cfg.Debug)
+			agent := grok.NewAgent(cdt, cfg.Timeout, cfg.Debug)
 			if err := agent.InputAndSubmitOnly(ctx, prompt); err != nil {
 				browserResultsMap[i] = Result{
 					Index:   browserTasks[i].InputIndex,
@@ -883,7 +880,7 @@ func processBrowserTasks(cfg *config.Config, inputs []InputSource, template stri
 				continue
 			}
 		} else {
-			agent := chatgpt.NewAgent(cdtForPage, cfg.Timeout, cfg.Debug)
+			agent := chatgpt.NewAgent(cdt, cfg.Timeout, cfg.Debug)
 			if err := agent.InputAndSubmitOnly(ctx, prompt); err != nil {
 				browserResultsMap[i] = Result{
 					Index:   browserTasks[i].InputIndex,
@@ -935,11 +932,8 @@ func processBrowserTasks(cfg *config.Config, inputs []InputSource, template stri
 				i+1, len(browserTasks), browserTasks[i].InputIndex, browserTasks[i].Site, browserTasks[i].PageID)
 		}
 
-		// Create isolated ChromeDevTools instance for this page
-		cdtForPage := mcp.NewChromeDevTools(mcpClient)
-
 		// Select the page for this task
-		if err := cdtForPage.SelectPage(ctx, parseInt(browserTasks[i].PageID), false); err != nil {
+		if err := cdt.SelectPage(ctx, parseInt(browserTasks[i].PageID), false); err != nil {
 			browserResultsMap[i] = Result{
 				Index:   browserTasks[i].InputIndex,
 				Site:    browserTasks[i].Site,
@@ -956,7 +950,7 @@ func processBrowserTasks(cfg *config.Config, inputs []InputSource, template stri
 		var responseText string
 
 		if browserTasks[i].Site == "grok" {
-			agent := grok.NewAgent(cdtForPage, cfg.Timeout, cfg.Debug)
+			agent := grok.NewAgent(cdt, cfg.Timeout, cfg.Debug)
 			response, err := agent.WaitForResponse(ctx)
 			if err != nil {
 				browserResultsMap[i] = Result{
@@ -972,7 +966,7 @@ func processBrowserTasks(cfg *config.Config, inputs []InputSource, template stri
 			}
 			responseText = response.Response.Text
 		} else {
-			agent := chatgpt.NewAgent(cdtForPage, cfg.Timeout, cfg.Debug)
+			agent := chatgpt.NewAgent(cdt, cfg.Timeout, cfg.Debug)
 			response, err := agent.WaitForResponse(ctx)
 			if err != nil {
 				browserResultsMap[i] = Result{
@@ -994,6 +988,20 @@ func processBrowserTasks(cfg *config.Config, inputs []InputSource, template stri
 			Site:    browserTasks[i].Site,
 			Success: true,
 			Text:    responseText,
+		}
+
+		// Clear large temporary variables to help GC
+		responseText = ""
+
+		// Close the page immediately after getting response to free memory
+		if cfg.Debug {
+			log.Printf("  [Task %d] Closing page %s to free memory", i, browserTasks[i].PageID)
+		}
+		if err := cdt.ClosePage(ctx, parseInt(browserTasks[i].PageID)); err != nil {
+			if cfg.Debug {
+				log.Printf("  [Task %d] Warning: failed to close page: %v", i, err)
+			}
+			// Don't fail the task if page close fails
 		}
 
 		completedCount++

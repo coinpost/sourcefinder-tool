@@ -468,3 +468,26 @@ func (cdt *ChromeDevTools) SelectPage(ctx context.Context, pageId int, bringToFr
 
 	return nil
 }
+
+// ClosePage closes the specified page by its ID to free memory
+func (cdt *ChromeDevTools) ClosePage(ctx context.Context, pageId int) error {
+	if cfgDebug {
+		log.Printf("[DEBUG] ClosePage: Closing page %d", pageId)
+	}
+
+	_, err := cdt.client.CallTool(ctx, "close_page", map[string]interface{}{
+		"pageId": pageId,
+	})
+	if err != nil {
+		if cfgDebug {
+			log.Printf("[DEBUG] ClosePage: Error closing page %d: %v", pageId, err)
+		}
+		return err
+	}
+
+	if cfgDebug {
+		log.Printf("[DEBUG] ClosePage: Page %d closed successfully", pageId)
+	}
+
+	return nil
+}
