@@ -73,6 +73,11 @@ type Config struct {
 	// Format: "url=<url> --engines=<engines> --max-results=<n> --model=<model>"
 	// Example: "url=https://api.example.com --engines=google,twitter --max-results=10 --model=gpt-5"
 	SourcefinderCommand string
+
+	// MaxConcurrentTabs is the maximum number of browser tabs to keep open simultaneously
+	// Set to 1 for fully sequential execution (open one tab, process it, close it, then next)
+	// Set to 5 for default parallelism
+	MaxConcurrentTabs int
 }
 
 const (
@@ -85,6 +90,9 @@ const (
 	// DefaultMaxRetries is the default maximum retry attempts
 	DefaultMaxRetries = 3
 
+	// DefaultMaxConcurrentTabs is the default maximum number of tabs to open simultaneously
+	DefaultMaxConcurrentTabs = 5
+
 	// DefaultSourcefinderURL is the default SourceFinder API URL
 	DefaultSourcefinderURL = "https://sourcefinder-api.coinpost.ai"
 
@@ -96,12 +104,13 @@ const (
 func Parse() (*Config, error) {
 	var textFlags stringSlice
 	cfg := &Config{
-		Timeout:        DefaultTimeout,
-		MCPCommand:     DefaultMCPCommand,
-		MaxRetries:     DefaultMaxRetries,
-		PromptTemplate: "user-prompt-input.md",
-		InputTexts:     []string{},
-		Site:           "chatgpt",
+		Timeout:           DefaultTimeout,
+		MCPCommand:        DefaultMCPCommand,
+		MaxRetries:        DefaultMaxRetries,
+		MaxConcurrentTabs: DefaultMaxConcurrentTabs,
+		PromptTemplate:    "user-prompt-input.md",
+		InputTexts:        []string{},
+		Site:              "chatgpt",
 	}
 
 	flag.Var(&textFlags, "text", "Input text to fact-check (can be specified multiple times)")
@@ -116,6 +125,7 @@ func Parse() (*Config, error) {
 	flag.StringVar(&cfg.Site, "site", "chatgpt", "Target site: chatgpt, grok, sourcefinder, all, or comma-separated list")
 	flag.StringVar(&cfg.SourcefinderCommand, "sourcefinder-command", DefaultSourcefinderCommand, "SourceFinder command parameters (url, engines, max-results, model)")
 	flag.StringVar(&cfg.SourcefinderAPIKey, "sourcefinder-api-key", "", "SourceFinder API key (if authentication enabled)")
+	flag.IntVar(&cfg.MaxConcurrentTabs, "max-concurrent-tabs", DefaultMaxConcurrentTabs, "Maximum number of tabs to keep open simultaneously (1=sequential, 5=default)")
 
 	flag.Usage = func() {
 		fmt.Fprintf(flag.CommandLine.Output(), "Usage: %s [options]\n\n", os.Args[0])
@@ -175,6 +185,10 @@ func (c *Config) Validate() error {
 
 	if c.MaxRetries < 0 {
 		return fmt.Errorf("max retries cannot be negative")
+	}
+
+	if c.MaxConcurrentTabs < 1 {
+		return fmt.Errorf("max-concurrent-tabs must be at least 1")
 	}
 
 	// Parse and validate site option

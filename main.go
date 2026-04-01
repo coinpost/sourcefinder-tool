@@ -694,7 +694,7 @@ func processAPITasks(cfg *config.Config, tasks []Task, template string) []Result
 	return results
 }
 
-// processBrowserTasks handles browser-based tasks (chatgpt, grok) using three-phase approach
+// processBrowserTasks handles browser-based tasks (chatgpt, grok) using three-phase approach with batch processing
 func processBrowserTasks(cfg *config.Config, inputs []InputSource, template string, browserTasks []Task) []Result {
 	// Create context with timeout
 	ctx, cancel := context.WithTimeout(context.Background(), cfg.Timeout+120*time.Second)
@@ -727,291 +727,310 @@ func processBrowserTasks(cfg *config.Config, inputs []InputSource, template stri
 	// Create a results map for browser tasks
 	browserResultsMap := make(map[int]Result) // key: task index in browserTasks
 
-	// Phase 1: Open all tabs sequentially for each task
-	log.Printf("Phase 1/3: Opening %d tabs...", len(browserTasks))
+	// Calculate batch size and total batches
+	batchSize := cfg.MaxConcurrentTabs
+	totalBatches := (len(browserTasks) + batchSize - 1) / batchSize
+
 	if cfg.Debug {
-		log.Printf("Phase 1: Opening %d tabs sequentially...", len(browserTasks))
+		log.Printf("Batch processing: %d tasks in %d batches (max %d tabs per batch)",
+			len(browserTasks), totalBatches, batchSize)
 	}
 
-	for i := range browserTasks {
-		if cfg.Debug {
-			log.Printf("  [Task %d/%d] Opening tab for Input %d on %s...",
-				i+1, len(browserTasks), browserTasks[i].InputIndex, browserTasks[i].Site)
+	// Process tasks in batches
+	for batchNum := 0; batchNum < totalBatches; batchNum++ {
+		batchStart := batchNum * batchSize
+		batchEnd := batchStart + batchSize
+		if batchEnd > len(browserTasks) {
+			batchEnd = len(browserTasks)
 		}
 
-		// Get site URL
-		siteURL := getSiteURL(browserTasks[i].Site)
-
-		// Skip if empty URL (shouldn't happen for browser tasks)
-		if siteURL == "" {
-			browserResultsMap[i] = Result{
-				Index:   browserTasks[i].InputIndex,
-				Site:    browserTasks[i].Site,
-				Success: false,
-				Error:   fmt.Errorf("empty site URL"),
-			}
-			if cfg.Debug {
-				log.Printf("  [Task %d] Failed: empty site URL", i)
-			}
-			continue
-		}
-
-		// Open new page with target site
-		_, err := cdt.NewPage(ctx, siteURL)
-		if err != nil {
-			browserResultsMap[i] = Result{
-				Index:   browserTasks[i].InputIndex,
-				Site:    browserTasks[i].Site,
-				Success: false,
-				Error:   fmt.Errorf("failed to open new page: %w", err),
-			}
-			if cfg.Debug {
-				log.Printf("  [Task %d] Failed to open tab: %v", i, err)
-			}
-			continue
-		}
-
-		// List pages to get the page ID of the newly created tab
-		pages, err := cdt.ListPages(ctx)
-		if err != nil {
-			browserResultsMap[i] = Result{
-				Index:   browserTasks[i].InputIndex,
-				Site:    browserTasks[i].Site,
-				Success: false,
-				Error:   fmt.Errorf("failed to list pages: %w", err),
-			}
-			if cfg.Debug {
-				log.Printf("  [Task %d] Failed to list pages: %v", i, err)
-			}
-			continue
-		}
-
-		// The last page in the list is the one we just created
-		if len(pages) == 0 {
-			browserResultsMap[i] = Result{
-				Index:   browserTasks[i].InputIndex,
-				Site:    browserTasks[i].Site,
-				Success: false,
-				Error:   fmt.Errorf("no pages found after opening new tab"),
-			}
-			continue
-		}
-
-		// Extract page ID from the last page
-		lastPage := pages[len(pages)-1]
-		pageID, ok := lastPage["pageId"].(float64)
-		if !ok {
-			browserResultsMap[i] = Result{
-				Index:   browserTasks[i].InputIndex,
-				Site:    browserTasks[i].Site,
-				Success: false,
-				Error:   fmt.Errorf("failed to extract pageId from page info"),
-			}
-			continue
-		}
-
-		browserTasks[i].PageID = fmt.Sprintf("%.0f", pageID) // Convert float64 to string
+		log.Printf("Batch %d/%d: Processing %d tasks (tasks %d-%d)...",
+			batchNum+1, totalBatches, batchEnd-batchStart, batchStart, batchEnd-1)
 
 		if cfg.Debug {
-			log.Printf("  [Task %d] Tab opened with pageId: %s", i, browserTasks[i].PageID)
+			log.Printf("Batch %d/%d: Opening %d tabs...",
+				batchNum+1, totalBatches, batchEnd-batchStart)
 		}
 
-		// Small delay between opening tabs
-		time.Sleep(500 * time.Millisecond)
-	}
-
-	successfulTabs := 0
-	for _, r := range browserResultsMap {
-		if r.Error == nil {
-			successfulTabs++
-		}
-	}
-	log.Printf("Phase 1 complete: %d/%d tabs opened", successfulTabs, len(browserTasks))
-
-	// Phase 2: Sequential input & submit (to avoid keyboard/click conflicts)
-	log.Printf("Phase 2/3: Submitting inputs to %d tasks...", len(browserTasks))
-	if cfg.Debug {
-		log.Printf("Phase 2: Sequential input and submit for %d tasks...", len(browserTasks))
-	}
-
-	for i := range browserTasks {
-		if _, exists := browserResultsMap[i]; exists && browserResultsMap[i].Error != nil {
-			continue
-		}
-
-		if cfg.Debug {
-			log.Printf("  [Task %d/%d] Submitting Input %d to %s (pageId: %s)...",
-				i+1, len(browserTasks), browserTasks[i].InputIndex, browserTasks[i].Site, browserTasks[i].PageID)
-		}
-
-		// Select the page for this task
-		if err := cdt.SelectPage(ctx, parseInt(browserTasks[i].PageID), false); err != nil {
-			browserResultsMap[i] = Result{
-				Index:   browserTasks[i].InputIndex,
-				Site:    browserTasks[i].Site,
-				Success: false,
-				Error:   fmt.Errorf("failed to select page: %w", err),
-			}
+		// Phase 1 for batch: Open all tabs
+		for i := batchStart; i < batchEnd; i++ {
 			if cfg.Debug {
-				log.Printf("  [Task %d] Failed to select page: %v", i, err)
+				log.Printf("  [Task %d/%d] Opening tab for Input %d on %s...",
+					i+1, len(browserTasks), browserTasks[i].InputIndex, browserTasks[i].Site)
 			}
-			continue
-		}
 
-		// Wait for page to stabilize after selection
-		time.Sleep(500 * time.Millisecond)
+			// Get site URL
+			siteURL := getSiteURL(browserTasks[i].Site)
 
-		// Input and submit only (will wait in parallel phase)
-		prompt := replaceTemplatePlaceholders(template, browserTasks[i].Input.Input)
-
-		// Create the appropriate agent based on site
-		if browserTasks[i].Site == "grok" {
-			agent := grok.NewAgent(cdt, cfg.Timeout, cfg.Debug)
-			if err := agent.InputAndSubmitOnly(ctx, prompt); err != nil {
+			// Skip if empty URL (shouldn't happen for browser tasks)
+			if siteURL == "" {
 				browserResultsMap[i] = Result{
 					Index:   browserTasks[i].InputIndex,
 					Site:    browserTasks[i].Site,
 					Success: false,
-					Error:   fmt.Errorf("input and submit failed: %w", err),
+					Error:   fmt.Errorf("empty site URL"),
 				}
 				if cfg.Debug {
-					log.Printf("  [Task %d] Failed to submit: %v", i, err)
+					log.Printf("  [Task %d] Failed: empty site URL", i)
 				}
 				continue
 			}
-		} else {
-			agent := chatgpt.NewAgent(cdt, cfg.Timeout, cfg.Debug)
-			if err := agent.InputAndSubmitOnly(ctx, prompt); err != nil {
-				browserResultsMap[i] = Result{
-					Index:   browserTasks[i].InputIndex,
-					Site:    browserTasks[i].Site,
-					Success: false,
-					Error:   fmt.Errorf("input and submit failed: %w", err),
-				}
-				if cfg.Debug {
-					log.Printf("  [Task %d] Failed to submit: %v", i, err)
-				}
-				continue
-			}
-		}
 
-		if cfg.Debug {
-			log.Printf("  [Task %d] Submitted successfully", i)
-		}
-
-		// Small delay between submissions
-		time.Sleep(500 * time.Millisecond)
-	}
-
-	successfulSubmissions := 0
-	for _, r := range browserResultsMap {
-		if r.Error == nil {
-			successfulSubmissions++
-		}
-	}
-	log.Printf("Phase 2 complete: %d/%d inputs submitted", successfulSubmissions, len(browserTasks))
-
-	// Phase 3: Sequential wait for responses
-	// Important: We wait sequentially (not in parallel) because chrome-devtools-mcp
-	// uses a single connection and all tool calls are serialized. When waiting in parallel,
-	// SelectPage calls from different goroutines interfere with each other, causing
-	// EvaluateScript to execute on the wrong page and fail to find elements.
-	log.Printf("Phase 3/3: Waiting for %d responses...", len(browserTasks)-successfulSubmissions)
-	if cfg.Debug {
-		log.Printf("Phase 3: Sequential waiting for %d responses...", len(browserTasks))
-	}
-
-	completedCount := 0
-	for i := range browserTasks {
-		if _, exists := browserResultsMap[i]; exists && browserResultsMap[i].Error != nil {
-			continue
-		}
-
-		if cfg.Debug {
-			log.Printf("  [Task %d/%d] Waiting for Input %d on %s (pageId: %s)...",
-				i+1, len(browserTasks), browserTasks[i].InputIndex, browserTasks[i].Site, browserTasks[i].PageID)
-		}
-
-		// Select the page for this task
-		if err := cdt.SelectPage(ctx, parseInt(browserTasks[i].PageID), false); err != nil {
-			browserResultsMap[i] = Result{
-				Index:   browserTasks[i].InputIndex,
-				Site:    browserTasks[i].Site,
-				Success: false,
-				Error:   fmt.Errorf("failed to select page: %w", err),
-			}
-			if cfg.Debug {
-				log.Printf("  [Task %d] Failed to select page: %v", i, err)
-			}
-			continue
-		}
-
-		// Wait for response using the appropriate agent
-		var responseText string
-
-		if browserTasks[i].Site == "grok" {
-			agent := grok.NewAgent(cdt, cfg.Timeout, cfg.Debug)
-			response, err := agent.WaitForResponse(ctx)
+			// Open new page with target site
+			_, err := cdt.NewPage(ctx, siteURL)
 			if err != nil {
 				browserResultsMap[i] = Result{
 					Index:   browserTasks[i].InputIndex,
 					Site:    browserTasks[i].Site,
 					Success: false,
-					Error:   fmt.Errorf("wait for response failed: %w", err),
+					Error:   fmt.Errorf("failed to open new page: %w", err),
 				}
 				if cfg.Debug {
-					log.Printf("  [Task %d] Failed to wait for response: %v", i, err)
+					log.Printf("  [Task %d] Failed to open tab: %v", i, err)
 				}
 				continue
 			}
-			responseText = response.Response.Text
-		} else {
-			agent := chatgpt.NewAgent(cdt, cfg.Timeout, cfg.Debug)
-			response, err := agent.WaitForResponse(ctx)
+
+			// List pages to get the page ID of the newly created tab
+			pages, err := cdt.ListPages(ctx)
 			if err != nil {
 				browserResultsMap[i] = Result{
 					Index:   browserTasks[i].InputIndex,
 					Site:    browserTasks[i].Site,
 					Success: false,
-					Error:   fmt.Errorf("wait for response failed: %w", err),
+					Error:   fmt.Errorf("failed to list pages: %w", err),
 				}
 				if cfg.Debug {
-					log.Printf("  [Task %d] Failed to wait for response: %v", i, err)
+					log.Printf("  [Task %d] Failed to list pages: %v", i, err)
 				}
 				continue
 			}
-			responseText = response.Response.Text
-		}
 
-		browserResultsMap[i] = Result{
-			Index:   browserTasks[i].InputIndex,
-			Site:    browserTasks[i].Site,
-			Success: true,
-			Text:    responseText,
-		}
-
-		// Clear large temporary variables to help GC
-		responseText = ""
-
-		// Close the page immediately after getting response to free memory
-		if cfg.Debug {
-			log.Printf("  [Task %d] Closing page %s to free memory", i, browserTasks[i].PageID)
-		}
-		if err := cdt.ClosePage(ctx, parseInt(browserTasks[i].PageID)); err != nil {
-			if cfg.Debug {
-				log.Printf("  [Task %d] Warning: failed to close page: %v", i, err)
+			// The last page in the list is the one we just created
+			if len(pages) == 0 {
+				browserResultsMap[i] = Result{
+					Index:   browserTasks[i].InputIndex,
+					Site:    browserTasks[i].Site,
+					Success: false,
+					Error:   fmt.Errorf("no pages found after opening new tab"),
+				}
+				continue
 			}
-			// Don't fail the task if page close fails
+
+			// Extract page ID from the last page
+			lastPage := pages[len(pages)-1]
+			pageID, ok := lastPage["pageId"].(float64)
+			if !ok {
+				browserResultsMap[i] = Result{
+					Index:   browserTasks[i].InputIndex,
+					Site:    browserTasks[i].Site,
+					Success: false,
+					Error:   fmt.Errorf("failed to extract pageId from page info"),
+				}
+				continue
+			}
+
+			browserTasks[i].PageID = fmt.Sprintf("%.0f", pageID) // Convert float64 to string
+
+			if cfg.Debug {
+				log.Printf("  [Task %d] Tab opened with pageId: %s", i, browserTasks[i].PageID)
+			}
+
+			// Small delay between opening tabs
+			time.Sleep(500 * time.Millisecond)
 		}
 
-		completedCount++
-		log.Printf("Progress: [%d/%d] Completed Input %d on %s",
-			completedCount, len(browserTasks)-successfulSubmissions, browserTasks[i].InputIndex, browserTasks[i].Site)
-
-		if cfg.Debug {
-			log.Printf("  [Task %d] Response received successfully for Input %d on %s",
-				i, browserTasks[i].InputIndex, browserTasks[i].Site)
+		// Count successful tabs in this batch
+		successfulTabs := 0
+		for i := batchStart; i < batchEnd; i++ {
+			if result, exists := browserResultsMap[i]; exists && result.Error == nil {
+				successfulTabs++
+			}
 		}
+		log.Printf("Batch %d/%d: Opened %d/%d tabs", batchNum+1, totalBatches, successfulTabs, batchEnd-batchStart)
+
+		// Phase 2 for batch: Sequential input & submit
+		log.Printf("Batch %d/%d: Submitting inputs...", batchNum+1, totalBatches)
+
+		for i := batchStart; i < batchEnd; i++ {
+			if _, exists := browserResultsMap[i]; exists && browserResultsMap[i].Error != nil {
+				continue
+			}
+
+			if cfg.Debug {
+				log.Printf("  [Task %d/%d] Submitting Input %d to %s (pageId: %s)...",
+					i+1, len(browserTasks), browserTasks[i].InputIndex, browserTasks[i].Site, browserTasks[i].PageID)
+			}
+
+			// Select the page for this task
+			if err := cdt.SelectPage(ctx, parseInt(browserTasks[i].PageID), false); err != nil {
+				browserResultsMap[i] = Result{
+					Index:   browserTasks[i].InputIndex,
+					Site:    browserTasks[i].Site,
+					Success: false,
+					Error:   fmt.Errorf("failed to select page: %w", err),
+				}
+				if cfg.Debug {
+					log.Printf("  [Task %d] Failed to select page: %v", i, err)
+				}
+				continue
+			}
+
+			// Wait for page to stabilize after selection
+			time.Sleep(500 * time.Millisecond)
+
+			// Input and submit only (will wait in next phase)
+			prompt := replaceTemplatePlaceholders(template, browserTasks[i].Input.Input)
+
+			// Create the appropriate agent based on site
+			if browserTasks[i].Site == "grok" {
+				agent := grok.NewAgent(cdt, cfg.Timeout, cfg.Debug)
+				if err := agent.InputAndSubmitOnly(ctx, prompt); err != nil {
+					browserResultsMap[i] = Result{
+						Index:   browserTasks[i].InputIndex,
+						Site:    browserTasks[i].Site,
+						Success: false,
+						Error:   fmt.Errorf("input and submit failed: %w", err),
+					}
+					if cfg.Debug {
+						log.Printf("  [Task %d] Failed to submit: %v", i, err)
+					}
+					continue
+				}
+			} else {
+				agent := chatgpt.NewAgent(cdt, cfg.Timeout, cfg.Debug)
+				if err := agent.InputAndSubmitOnly(ctx, prompt); err != nil {
+					browserResultsMap[i] = Result{
+						Index:   browserTasks[i].InputIndex,
+						Site:    browserTasks[i].Site,
+						Success: false,
+						Error:   fmt.Errorf("input and submit failed: %w", err),
+					}
+					if cfg.Debug {
+						log.Printf("  [Task %d] Failed to submit: %v", i, err)
+					}
+					continue
+				}
+			}
+
+			if cfg.Debug {
+				log.Printf("  [Task %d] Submitted successfully", i)
+			}
+
+			// Small delay between submissions
+			time.Sleep(500 * time.Millisecond)
+		}
+
+		// Count successful submissions in this batch
+		successfulSubmissions := 0
+		for i := batchStart; i < batchEnd; i++ {
+			if result, exists := browserResultsMap[i]; exists && result.Error == nil {
+				successfulSubmissions++
+			}
+		}
+		log.Printf("Batch %d/%d: Submitted %d/%d inputs", batchNum+1, totalBatches, successfulSubmissions, batchEnd-batchStart)
+
+		// Phase 3 for batch: Sequential wait for responses
+		// Important: We wait sequentially (not in parallel) because chrome-devtools-mcp
+		// uses a single connection and all tool calls are serialized.
+		log.Printf("Batch %d/%d: Waiting for responses...", batchNum+1, totalBatches)
+
+		for i := batchStart; i < batchEnd; i++ {
+			if _, exists := browserResultsMap[i]; exists && browserResultsMap[i].Error != nil {
+				continue
+			}
+
+			if cfg.Debug {
+				log.Printf("  [Task %d/%d] Waiting for Input %d on %s (pageId: %s)...",
+					i+1, len(browserTasks), browserTasks[i].InputIndex, browserTasks[i].Site, browserTasks[i].PageID)
+			}
+
+			// Select the page for this task
+			if err := cdt.SelectPage(ctx, parseInt(browserTasks[i].PageID), false); err != nil {
+				browserResultsMap[i] = Result{
+					Index:   browserTasks[i].InputIndex,
+					Site:    browserTasks[i].Site,
+					Success: false,
+					Error:   fmt.Errorf("failed to select page: %w", err),
+				}
+				if cfg.Debug {
+					log.Printf("  [Task %d] Failed to select page: %v", i, err)
+				}
+				continue
+			}
+
+			// Wait for response using the appropriate agent
+			var responseText string
+
+			if browserTasks[i].Site == "grok" {
+				agent := grok.NewAgent(cdt, cfg.Timeout, cfg.Debug)
+				response, err := agent.WaitForResponse(ctx)
+				if err != nil {
+					browserResultsMap[i] = Result{
+						Index:   browserTasks[i].InputIndex,
+						Site:    browserTasks[i].Site,
+						Success: false,
+						Error:   fmt.Errorf("wait for response failed: %w", err),
+					}
+					if cfg.Debug {
+						log.Printf("  [Task %d] Failed to wait for response: %v", i, err)
+					}
+					continue
+				}
+				responseText = response.Response.Text
+			} else {
+				agent := chatgpt.NewAgent(cdt, cfg.Timeout, cfg.Debug)
+				response, err := agent.WaitForResponse(ctx)
+				if err != nil {
+					browserResultsMap[i] = Result{
+						Index:   browserTasks[i].InputIndex,
+						Site:    browserTasks[i].Site,
+						Success: false,
+						Error:   fmt.Errorf("wait for response failed: %w", err),
+					}
+					if cfg.Debug {
+						log.Printf("  [Task %d] Failed to wait for response: %v", i, err)
+					}
+					continue
+				}
+				responseText = response.Response.Text
+			}
+
+			browserResultsMap[i] = Result{
+				Index:   browserTasks[i].InputIndex,
+				Site:    browserTasks[i].Site,
+				Success: true,
+				Text:    responseText,
+			}
+
+			// Clear large temporary variables to help GC
+			responseText = ""
+
+			// Close the page immediately after getting response to free memory
+			if cfg.Debug {
+				log.Printf("  [Task %d] Closing page %s to free memory", i, browserTasks[i].PageID)
+			}
+			if err := cdt.ClosePage(ctx, parseInt(browserTasks[i].PageID)); err != nil {
+				if cfg.Debug {
+					log.Printf("  [Task %d] Warning: failed to close page: %v", i, err)
+				}
+				// Don't fail the task if page close fails
+			}
+
+			if cfg.Debug {
+				log.Printf("  [Task %d] Response received successfully for Input %d on %s",
+					i, browserTasks[i].InputIndex, browserTasks[i].Site)
+			}
+		}
+
+		// Count successful responses in this batch
+		successfulResponses := 0
+		for i := batchStart; i < batchEnd; i++ {
+			if result, exists := browserResultsMap[i]; exists && result.Success {
+				successfulResponses++
+			}
+		}
+		log.Printf("Batch %d/%d: Completed %d/%d tasks", batchNum+1, totalBatches, successfulResponses, batchEnd-batchStart)
 	}
 
 	// Convert browser results map to slice in order
@@ -1036,7 +1055,7 @@ func processBrowserTasks(cfg *config.Config, inputs []InputSource, template stri
 			finalSuccessCount++
 		}
 	}
-	log.Printf("Phase 3 complete: %d/%d responses received", finalSuccessCount, len(browserResults))
+	log.Printf("All batches complete: %d/%d tasks successful", finalSuccessCount, len(browserResults))
 
 	return browserResults
 }
