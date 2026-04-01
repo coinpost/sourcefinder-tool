@@ -1,6 +1,6 @@
 # SourceFinder Tool
 
-A Go-based tool for automating interactions with AI services (ChatGPT, Grok, and SourceFinder API) via Chrome DevTools Protocol. It can batch process multiple inputs across multiple AI services and collect their responses for fact-checking and source verification tasks.
+A CLI tool for automating AI service interactions. Supports ChatGPT, Grok, and SourceFinder API via Chrome DevTools Protocol. Batch process inputs for fact-checking and source verification.
 
 ## Features
 
