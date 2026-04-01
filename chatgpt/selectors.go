@@ -110,24 +110,60 @@ func (s *Selectors) FindSendButtonUID(snapshotText string) (string, error) {
 // GetResponseScript returns JavaScript code to extract the latest ChatGPT response
 func (s *Selectors) GetResponseScript() string {
 	return `() => {
-  // Find ALL div.cm-content elements and get the LAST one (most recent response)
-  const allDivs = document.querySelectorAll('div.cm-content');
-
-  if (allDivs.length === 0) {
-    return { error: "div.cm-content not found" };
+  // Strategy 1: Try old div.cm-content structure (backward compatibility)
+  const cmContentDivs = document.querySelectorAll('div.cm-content');
+  if (cmContentDivs.length > 0) {
+    const lastDiv = cmContentDivs[cmContentDivs.length - 1];
+    const text = lastDiv.textContent || lastDiv.innerText || '';
+    if (text.trim().length > 0) {
+      return {
+        text: text,
+        timestamp: new Date().toISOString(),
+        method: 'cm_content',
+        totalDivs: cmContentDivs.length
+      };
+    }
   }
 
-  // Get the LAST div.cm-content element (most recent response)
-  const readonlyDiv = allDivs[allDivs.length - 1];
+  // Strategy 2: Try new section[data-message-author-role="assistant"] structure
+  const assistantSections = document.querySelectorAll('section[data-message-author-role="assistant"]');
+  if (assistantSections.length > 0) {
+    // Get the LAST assistant section (most recent response)
+    const lastSection = assistantSections[assistantSections.length - 1];
 
-  // Extract the text content
-  const text = readonlyDiv.textContent || readonlyDiv.innerText || '';
+    // Find markdown content within
+    const markdownDiv = lastSection.querySelector('div.markdown.prose');
+    const targetDiv = markdownDiv || lastSection;
+
+    const text = targetDiv.textContent || targetDiv.innerText || '';
+    if (text.trim().length > 0) {
+      return {
+        text: text,
+        timestamp: new Date().toISOString(),
+        method: 'assistant_section',
+        totalDivs: assistantSections.length
+      };
+    }
+  }
+
+  // Strategy 3: Try any element with data-message-author-role="assistant"
+  const allAssistantElements = document.querySelectorAll('[data-message-author-role="assistant"]');
+  if (allAssistantElements.length > 0) {
+    const lastElement = allAssistantElements[allAssistantElements.length - 1];
+    const text = lastElement.textContent || lastElement.innerText || '';
+    return {
+      text: text,
+      timestamp: new Date().toISOString(),
+      method: 'any_assistant_element',
+      totalDivs: allAssistantElements.length
+    };
+  }
 
   return {
-    text: text,
-    timestamp: new Date().toISOString(),
-    method: 'cm_content_last',
-    totalDivs: allDivs.length
+    error: "No assistant response found",
+    cmContentCount: cmContentDivs.length,
+    assistantSectionCount: assistantSections ? assistantSections.length : 0,
+    allAssistantElementsCount: allAssistantElements ? allAssistantElements.length : 0
   };
 }`
 }
@@ -138,12 +174,14 @@ func (s *Selectors) DiagnosePageScript() string {
   const result = {
     url: window.location.href,
     cmContentDivs: [],
+    assistantSections: [],
+    allAssistantElements: 0,
     allDivs: 0,
     textareas: 0,
     buttons: 0
   };
 
-  // Find all div.cm-content elements
+  // Find all div.cm-content elements (old structure)
   const cmDivs = document.querySelectorAll('div.cm-content');
   result.cmContentDivs = Array.from(cmDivs).map((div, i) => ({
     index: i,
@@ -152,6 +190,21 @@ func (s *Selectors) DiagnosePageScript() string {
     textPreview: (div.textContent || '').substring(0, 100),
     visible: div.offsetParent !== null
   }));
+
+  // Find all assistant sections (new structure)
+  const sections = document.querySelectorAll('section[data-message-author-role="assistant"]');
+  result.assistantSections = Array.from(sections).map((section, i) => ({
+    index: i,
+    dataTestId: section.getAttribute('data-testid'),
+    dataTurn: section.getAttribute('data-turn'),
+    classes: section.className,
+    textLength: (section.textContent || '').length,
+    textPreview: (section.textContent || '').substring(0, 100),
+    visible: section.offsetParent !== null
+  }));
+
+  // Count all assistant elements
+  result.allAssistantElements = document.querySelectorAll('[data-message-author-role="assistant"]').length;
 
   // Count other elements
   result.allDivs = document.querySelectorAll('div').length;

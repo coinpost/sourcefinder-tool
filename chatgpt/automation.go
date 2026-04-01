@@ -206,21 +206,31 @@ func (a *Agent) ProcessDocument(ctx context.Context, documentContent string) (*R
 		default:
 		}
 
-		// Check if div.cm-content has content
+		// Check if response has content (multi-strategy approach)
 		checkScript := `() => {
-			const allDivs = document.querySelectorAll('div.cm-content');
-			if (allDivs.length === 0) {
-				return { found: false, hasContent: false };
+			// Strategy 1: Check old div.cm-content structure
+			const cmContentDivs = document.querySelectorAll('div.cm-content');
+			if (cmContentDivs.length > 0) {
+				const div = cmContentDivs[cmContentDivs.length - 1];
+				const text = div.textContent || div.innerText || '';
+				if (text.trim().length > 0) {
+					return { found: true, hasContent: true, length: text.trim().length, method: 'cm_content' };
+				}
 			}
-			// Get the LAST div.cm-content (most recent response)
-			const div = allDivs[allDivs.length - 1];
-			const text = div.textContent || div.innerText || '';
-			return {
-				found: true,
-				hasContent: text.trim().length > 0,
-				length: text.trim().length,
-				totalDivs: allDivs.length
-			};
+
+			// Strategy 2: Check new section[data-message-author-role="assistant"] structure
+			const assistantSections = document.querySelectorAll('section[data-message-author-role="assistant"]');
+			if (assistantSections.length > 0) {
+				const section = assistantSections[assistantSections.length - 1];
+				const markdownDiv = section.querySelector('div.markdown.prose');
+				const targetDiv = markdownDiv || section;
+				const text = targetDiv.textContent || targetDiv.innerText || '';
+				if (text.trim().length > 0) {
+					return { found: true, hasContent: true, length: text.trim().length, method: 'assistant_section' };
+				}
+			}
+
+			return { found: false, hasContent: false, method: 'none' };
 		}`
 
 		result, err := a.cdt.EvaluateScript(ctx, checkScript)
@@ -232,8 +242,12 @@ func (a *Agent) ProcessDocument(ctx context.Context, documentContent string) (*R
 			if resultMap, ok := result.(map[string]interface{}); ok {
 				if found, ok := resultMap["found"].(bool); ok && found {
 					if hasContent, ok := resultMap["hasContent"].(bool); ok && hasContent {
+						methodStr := ""
+						if method, ok := resultMap["method"].(string); ok {
+							methodStr = method
+						}
 						if a.debug {
-							log.Printf("div.cm-content has content! (%d chars)", int(resultMap["length"].(float64)))
+							log.Printf("Response found via %s! (%d chars)", methodStr, int(resultMap["length"].(float64)))
 						}
 						contentFound = true
 						break
