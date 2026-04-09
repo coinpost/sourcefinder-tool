@@ -330,6 +330,7 @@ func (s *Selectors) CheckResponseReadyScript() string {
 
 // GetResponseScript returns JavaScript code to extract the latest Grok response
 // This extracts JSON code blocks from the LAST response-content-markdown div
+// Handles both markdown code blocks and Grok's formatted code blocks
 func (s *Selectors) GetResponseScript() string {
 	return `() => {
 		// Find ALL response containers and get the LAST one (most recent)
@@ -342,55 +343,144 @@ func (s *Selectors) GetResponseScript() string {
 		// Get the LAST response div (most recent response from Grok)
 		const responseDiv = responseDivs[responseDivs.length - 1];
 
-		// Try to find JSON code blocks within the response
-		// Look for <pre><code> blocks or markdown code blocks
-		const codeBlocks = responseDiv.querySelectorAll('pre code, code');
+		// Helper function to validate JSON
+		const isValidJSON = (text) => {
+			const trimmed = text.trim();
+			if (!trimmed.startsWith('{') && !trimmed.startsWith('[')) {
+				return false;
+			}
+			try {
+				JSON.parse(trimmed);
+				return true;
+			} catch (e) {
+				return false;
+			}
+		};
 
 		// Collect all valid JSON blocks
 		const jsonBlocks = [];
 
-		for (const codeBlock of codeBlocks) {
+		// Strategy 1: Look for standard markdown code blocks (<pre><code>)
+		const preCodeBlocks = responseDiv.querySelectorAll('pre code');
+		for (const codeBlock of preCodeBlocks) {
 			const text = codeBlock.textContent || codeBlock.innerText || '';
-			const trimmed = text.trim();
+			if (isValidJSON(text)) {
+				jsonBlocks.push({
+					text: text.trim(),
+					html: codeBlock.innerHTML || '',
+					length: text.length,
+					strategy: 'pre_code'
+				});
+			}
+		}
 
-			// Check if this looks like JSON (starts with { or [)
-			if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
-				try {
-					// Try to parse as JSON to verify it's valid
-					JSON.parse(trimmed);
+		// Strategy 2: Look for standalone <code> elements (not in pre)
+		const allCodeElements = responseDiv.querySelectorAll('code');
+		for (const codeElement of allCodeElements) {
+			// Skip if already inside a pre (we already checked those)
+			if (codeElement.closest('pre')) continue;
 
-					// It's valid JSON, add to collection
+			const text = codeElement.textContent || codeElement.innerText || '';
+			if (isValidJSON(text)) {
+				jsonBlocks.push({
+					text: text.trim(),
+					html: codeElement.innerHTML || '',
+					length: text.length,
+					strategy: 'standalone_code'
+				});
+			}
+		}
+
+		// Strategy 3: Look for div elements with code-like styling or classes
+		// Grok might use styled divs for code display
+		const codeDivs = responseDiv.querySelectorAll('div[class*="code"], div[class*="json"], div[class*="highlight"], div[class*="syntax"]');
+		for (const divElement of codeDivs) {
+			const text = divElement.textContent || divElement.innerText || '';
+			// Check if the div mostly contains code (high ratio of brackets/quotes)
+			const bracketCount = (text.match(/[{}[\]]/g) || []).length;
+			const quoteCount = (text.match(/["']/g) || []).length;
+			const totalChars = text.length;
+
+			// If it has many brackets/quotes relative to its size, it's likely code
+			if (totalChars > 50 && (bracketCount > 5 || quoteCount > 10)) {
+				if (isValidJSON(text)) {
 					jsonBlocks.push({
-						text: trimmed,
-						html: codeBlock.innerHTML || '',
-						length: trimmed.length
+						text: text.trim(),
+						html: divElement.innerHTML || '',
+						length: text.length,
+						strategy: 'styled_div'
 					});
-				} catch (e) {
-					// Not valid JSON, skip
-					continue;
 				}
 			}
 		}
 
-		// If we found JSON blocks, return the LAST one (most complete/recent)
+		// Strategy 4: Look for elements with specific data attributes or roles
+		const dataCodeElements = responseDiv.querySelectorAll('[data-code="true"], [data-json="true"], [role="code"]');
+		for (const elem of dataCodeElements) {
+			const text = elem.textContent || elem.innerText || '';
+			if (isValidJSON(text)) {
+				jsonBlocks.push({
+					text: text.trim(),
+					html: elem.innerHTML || '',
+					length: text.length,
+					strategy: 'data_attribute'
+				});
+			}
+		}
+
+		// Strategy 5: Look for code blocks with specific class patterns that Grok uses
+		// Try to catch any code-like elements we might have missed
+		const allElements = responseDiv.querySelectorAll('*');
+		for (const elem of allElements) {
+			// Only look at leaf nodes (no child element nodes)
+			if (elem.children.length > 0) continue;
+
+			const className = elem.className || '';
+			const classStr = typeof className === 'string' ? className : '';
+
+			// Look for class names suggesting code display
+			if (classStr.includes('hljs') || classStr.includes('chroma') ||
+				classStr.includes('code-') || classStr.includes('json-') ||
+				classStr.includes('token') || classStr.includes('syntax')) {
+
+				const text = elem.textContent || elem.innerText || '';
+				// Only consider substantial text blocks
+				if (text.length > 100 && isValidJSON(text)) {
+					// Check if we haven't already added this content
+					const alreadyAdded = jsonBlocks.some(block => block.text === text.trim());
+					if (!alreadyAdded) {
+						jsonBlocks.push({
+							text: text.trim(),
+							html: elem.innerHTML || '',
+							length: text.length,
+							strategy: 'class_match'
+						});
+					}
+				}
+			}
+		}
+
+		// If we found JSON blocks using element-based strategies, return the largest one
 		if (jsonBlocks.length > 0) {
-			const lastJson = jsonBlocks[jsonBlocks.length - 1];
+			// Sort by length (descending) to get the most complete JSON
+			jsonBlocks.sort((a, b) => b.length - a.length);
+			const largestJson = jsonBlocks[0];
+
 			return {
-				text: lastJson.text,
-				html: lastJson.html,
+				text: largestJson.text,
+				html: largestJson.html,
 				timestamp: new Date().toISOString(),
-				method: 'json_code_block',
-				selector: 'last div.response-content-markdown.markdown code',
+				method: 'element_based_extraction',
+				strategy: largestJson.strategy,
+				selector: 'last div.response-content-markdown.markdown',
 				totalDivs: responseDivs.length,
 				totalJsonBlocks: jsonBlocks.length
 			};
 		}
 
-		// If no JSON code block found, try to extract from the entire content
+		// Strategy 6: Fallback to text-based balanced bracket matching
 		const fullText = (responseDiv.textContent || responseDiv.innerText || '').trim();
 
-		// Try to find JSON patterns in the text using balanced bracket matching
-		// This handles nested objects/arrays correctly
 		const findBalancedJson = (text, startChar, endChar) => {
 			const results = [];
 			let depth = 0;
@@ -450,7 +540,7 @@ func (s *Selectors) GetResponseScript() string {
 			};
 		}
 
-		// Fallback: return all text content (in case there's no JSON)
+		// Final fallback: return all text content (in case there's no JSON)
 		return {
 			text: fullText,
 			html: responseDiv.innerHTML || '',

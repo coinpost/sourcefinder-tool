@@ -836,8 +836,8 @@ func processBrowserTasks(cfg *config.Config, inputs []InputSource, template stri
 				log.Printf("  [Task %d] Tab opened with pageId: %s", i, browserTasks[i].PageID)
 			}
 
-			// Small delay between opening tabs
-			time.Sleep(500 * time.Millisecond)
+			// Longer delay between opening tabs to reduce SSL handshake pressure
+			time.Sleep(2 * time.Second)
 		}
 
 		// Count successful tabs in this batch
@@ -1021,6 +1021,9 @@ func processBrowserTasks(cfg *config.Config, inputs []InputSource, template stri
 				log.Printf("  [Task %d] Response received successfully for Input %d on %s",
 					i, browserTasks[i].InputIndex, browserTasks[i].Site)
 			}
+
+			// Write result immediately to file
+			writeSingleResult(cfg, inputs, browserResultsMap[i])
 		}
 
 		// Count successful responses in this batch
@@ -1031,6 +1034,13 @@ func processBrowserTasks(cfg *config.Config, inputs []InputSource, template stri
 			}
 		}
 		log.Printf("Batch %d/%d: Completed %d/%d tasks", batchNum+1, totalBatches, successfulResponses, batchEnd-batchStart)
+
+		// Add delay between batches to let MCP recover and reduce SSL handshake pressure
+		if batchNum < totalBatches-1 {
+			log.Printf("Batch %d/%d: Waiting 5 seconds before next batch to let MCP recover...",
+				batchNum+1, totalBatches)
+			time.Sleep(5 * time.Second)
+		}
 	}
 
 	// Convert browser results map to slice in order
@@ -1286,6 +1296,79 @@ func generateOutputFilename(basePath string, title string, index int) string {
 	return fmt.Sprintf("%s_%d%s", baseName, index, ext)
 }
 
+// writeSingleResult writes a single result to its output file immediately
+func writeSingleResult(cfg *config.Config, inputs []InputSource, result Result) {
+	// Skip if not successful
+	if !result.Success {
+		return
+	}
+
+	// Don't write if no output path specified
+	if cfg.OutputPath == "" {
+		return
+	}
+
+	// Find the corresponding input
+	var input *InputSource
+	for i := range inputs {
+		if inputs[i].Index == result.Index {
+			input = &inputs[i]
+			break
+		}
+	}
+	if input == nil {
+		if cfg.Debug {
+			log.Printf("Warning: could not find input for result index %d", result.Index)
+		}
+		return
+	}
+
+	// Prepare output content
+	var outputs []string
+
+	// Add input separator
+	outputs = append(outputs, fmt.Sprintf("=== Input %d ===", result.Index))
+
+	// Add structured input information if available
+	if input.Input.URL != "" {
+		outputs = append(outputs, fmt.Sprintf("URL: %s", input.Input.URL))
+	}
+	if input.Input.Title != "" {
+		outputs = append(outputs, fmt.Sprintf("Title: %s", input.Input.Title))
+	}
+	if input.Input.Content != "" {
+		outputs = append(outputs, fmt.Sprintf("Content: %s", input.Input.Content))
+	}
+	if len(input.Input.SourceURLs) > 0 {
+		outputs = append(outputs, fmt.Sprintf("Source URLs: %s", strings.Join(input.Input.SourceURLs, ", ")))
+	}
+
+	// Add site label
+	if result.Site == "sourcefinder" && result.JobID != "" {
+		outputs = append(outputs, fmt.Sprintf("--- %s (job_id:%s) ---", result.Site, result.JobID))
+	} else {
+		outputs = append(outputs, fmt.Sprintf("--- %s ---", result.Site))
+	}
+
+	// Add the result text (formatted as JSON if possible)
+	formattedText := formatJSONIfPossible(result.Text)
+	outputs = append(outputs, formattedText)
+
+	// Generate output filename
+	outputFilename := generateOutputFilename(cfg.OutputPath, input.Input.Title, result.Index)
+
+	// Join outputs
+	finalOutput := strings.Join(outputs, "\n\n")
+
+	// Write to file
+	if err := os.WriteFile(outputFilename, []byte(finalOutput), 0644); err != nil {
+		fmt.Fprintf(os.Stderr, "Error writing output file %s: %v\n", outputFilename, err)
+		return
+	}
+
+	log.Printf("✓ Output written to: %s", outputFilename)
+}
+
 // outputResults outputs all results
 func outputResults(cfg *config.Config, inputs []InputSource, results []Result) {
 	// Group results by input index and site
@@ -1313,95 +1396,16 @@ func outputResults(cfg *config.Config, inputs []InputSource, results []Result) {
 		}
 	}
 
-	// If output path is specified, write separate files for each input
+	// If output path is specified, results were already written individually
+	// Just print summary statistics
 	if cfg.OutputPath != "" {
-		for inputIdx := 0; inputIdx <= inputCount; inputIdx++ {
-			var outputs []string
-			hasAnyResult := false
-
-			// Get input information
-			var inputTitle string
-			if input, inputExists := inputMap[inputIdx]; inputExists {
-				inputTitle = input.Input.Title
-			}
-
-			// Collect all results for this input
-			for _, site := range cfg.Sites {
-				key := fmt.Sprintf("%d-%s", inputIdx, site)
-				if result, exists := resultMap[key]; exists {
-					if !hasAnyResult {
-						// Add input separator
-						if inputCount > 0 {
-							outputs = append(outputs, fmt.Sprintf("=== Input %d ===", inputIdx))
-						}
-
-						// Add structured input information if available
-						if input, inputExists := inputMap[inputIdx]; inputExists {
-							if input.Input.URL != "" {
-								outputs = append(outputs, fmt.Sprintf("URL: %s", input.Input.URL))
-							}
-							if input.Input.Title != "" {
-								outputs = append(outputs, fmt.Sprintf("Title: %s", input.Input.Title))
-							}
-							if input.Input.Content != "" {
-								outputs = append(outputs, fmt.Sprintf("Content: %s", input.Input.Content))
-							}
-							if len(input.Input.SourceURLs) > 0 {
-								outputs = append(outputs, fmt.Sprintf("Source URLs: %s", strings.Join(input.Input.SourceURLs, ", ")))
-							}
-						}
-
-						hasAnyResult = true
-					}
-
-					// Add site label if multiple sites or if sourcefinder with job ID
-					if len(cfg.Sites) > 1 {
-						if result.Site == "sourcefinder" && result.JobID != "" {
-							outputs = append(outputs, fmt.Sprintf("--- %s (job_id:%s) ---", result.Site, result.JobID))
-						} else {
-							outputs = append(outputs, fmt.Sprintf("--- %s ---", result.Site))
-						}
-					} else if result.Site == "sourcefinder" && result.JobID != "" {
-						// Single site case - show job ID for sourcefinder
-						outputs = append(outputs, fmt.Sprintf("--- %s (job_id:%s) ---", result.Site, result.JobID))
-					}
-
-					// Try to format as JSON if possible
-					formattedText := formatJSONIfPossible(result.Text)
-					outputs = append(outputs, formattedText)
-				}
-			}
-
-			// Only write file if we have results
-			if hasAnyResult {
-				// Generate output filename
-				outputFilename := generateOutputFilename(cfg.OutputPath, inputTitle, inputIdx)
-
-				// Join outputs
-				finalOutput := strings.Join(outputs, "\n\n")
-
-				// Write to file
-				if err := os.WriteFile(outputFilename, []byte(finalOutput), 0644); err != nil {
-					fmt.Fprintf(os.Stderr, "Error writing output file %s: %v\n", outputFilename, err)
-					os.Exit(1)
-				}
-
-				if cfg.Debug {
-					log.Printf("Output written to: %s", outputFilename)
-				}
+		successCount := 0
+		for _, r := range results {
+			if r.Success {
+				successCount++
 			}
 		}
-
-		if cfg.Debug {
-			successCount := 0
-			for _, r := range results {
-				if r.Success {
-					successCount++
-				}
-			}
-			log.Printf("Done! Processed %d/%d inputs successfully", successCount, len(results))
-		}
-
+		log.Printf("Done! Processed %d/%d inputs successfully (results written to individual files)", successCount, len(results))
 		return
 	}
 

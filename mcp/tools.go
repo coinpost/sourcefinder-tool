@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"strings"
+	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
 )
@@ -48,27 +49,72 @@ func (cdt *ChromeDevTools) NavigatePage(ctx context.Context, url string) error {
 }
 
 // NewPage opens a new browser tab with the specified URL
-// Returns the targetId if available for multi-tab operations
+// Uses retry logic to handle transient MCP connection issues
 func (cdt *ChromeDevTools) NewPage(ctx context.Context, url string) (string, error) {
-	result, err := cdt.client.CallTool(ctx, "new_page", map[string]interface{}{
-		"url": url,
-	})
-	if err != nil {
-		return "", err
-	}
+	maxRetries := 3
+	retryDelay := 500 * time.Millisecond
 
-	// Try to extract targetId from result
-	if len(result.Content) > 0 {
-		if c, ok := result.Content[0].(mcp.TextContent); ok {
-			if cfgDebug {
-				log.Printf("[DEBUG] NewPage result: %s", c.Text)
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		if cfgDebug {
+			log.Printf("[DEBUG] NewPage: Attempt %d/%d, calling new_page with url=%s",
+				attempt+1, maxRetries, url)
+		}
+
+		// Use a separate timeout context for this call
+		callTimeout := 45 * time.Second // Longer timeout for NewPage as it needs to load a page
+		if deadline, ok := ctx.Deadline(); ok {
+			remaining := time.Until(deadline)
+			if remaining < callTimeout {
+				callTimeout = remaining
 			}
 		}
+
+		callCtx, cancel := context.WithTimeout(context.Background(), callTimeout)
+
+		result, err := cdt.client.CallTool(callCtx, "new_page", map[string]interface{}{
+			"url": url,
+		})
+		cancel()
+
+		if err != nil {
+			if cfgDebug {
+				log.Printf("[DEBUG] NewPage: Error on attempt %d: %v", attempt+1, err)
+			}
+
+			// If this is not the last attempt, wait and retry
+			if attempt < maxRetries-1 {
+				if cfgDebug {
+					log.Printf("[DEBUG] NewPage: Retrying in %v...", retryDelay)
+				}
+				time.Sleep(retryDelay)
+				// Exponential backoff
+				retryDelay = retryDelay * 2
+				continue
+			}
+
+			return "", fmt.Errorf("failed after %d attempts: %w", maxRetries, err)
+		}
+
+		// Try to extract targetId from result
+		if len(result.Content) > 0 {
+			if c, ok := result.Content[0].(mcp.TextContent); ok {
+				if cfgDebug {
+					log.Printf("[DEBUG] NewPage result: %s", c.Text)
+				}
+			}
+		}
+
+		// Success
+		if cfgDebug && attempt > 0 {
+			log.Printf("[DEBUG] NewPage: Succeeded on attempt %d", attempt+1)
+		}
+
+		// Return empty targetId for now
+		// In a real implementation, we would extract the actual targetId
+		return "", nil
 	}
 
-	// Return empty targetId for now
-	// In a real implementation, we would extract the actual targetId
-	return "", nil
+	return "", fmt.Errorf("unexpected: reached end of retry loop")
 }
 
 // WaitFor waits for specified text to appear on the page
@@ -440,33 +486,116 @@ func SetDebug(debug bool) {
 }
 
 // SelectPage selects a page as the context for future tool calls
+// Uses retry logic to handle transient MCP connection issues
+// On retry failure, will try to refresh page list and use correct pageId
 func (cdt *ChromeDevTools) SelectPage(ctx context.Context, pageId int, bringToFront bool) error {
-	if cfgDebug {
-		log.Printf("[DEBUG] SelectPage: Calling select_page with pageId=%d, bringToFront=%v", pageId, bringToFront)
-	}
+	maxRetries := 3
+	retryDelay := 500 * time.Millisecond
 
-	args := map[string]interface{}{
-		"pageId": pageId,
-	}
-	if bringToFront {
-		args["bringToFront"] = true
-	}
-
-	result, err := cdt.client.CallTool(ctx, "select_page", args)
-	if err != nil {
+	for attempt := 0; attempt < maxRetries; attempt++ {
 		if cfgDebug {
-			log.Printf("[DEBUG] SelectPage: Error: %v", err)
+			log.Printf("[DEBUG] SelectPage: Attempt %d/%d, calling select_page with pageId=%d, bringToFront=%v",
+				attempt+1, maxRetries, pageId, bringToFront)
 		}
-		return err
+
+		args := map[string]interface{}{
+			"pageId": pageId,
+		}
+		if bringToFront {
+			args["bringToFront"] = true
+		}
+
+		// Use a separate timeout context for this call
+		// Default to 30 seconds if parent context has no deadline
+		callTimeout := 30 * time.Second
+		if deadline, ok := ctx.Deadline(); ok {
+			remaining := time.Until(deadline)
+			if remaining < callTimeout {
+				callTimeout = remaining
+			}
+		}
+
+		callCtx, cancel := context.WithTimeout(context.Background(), callTimeout)
+
+		result, err := cdt.client.CallTool(callCtx, "select_page", args)
+		cancel()
+
+		if err == nil {
+			// Success
+			if cfgDebug && len(result.Content) > 0 {
+				if c, ok := result.Content[0].(mcp.TextContent); ok {
+					log.Printf("[DEBUG] SelectPage: Result: %s", c.Text)
+				}
+			}
+			if cfgDebug && attempt > 0 {
+				log.Printf("[DEBUG] SelectPage: Succeeded on attempt %d", attempt+1)
+			}
+			return nil
+		}
+
+		// Error occurred
+		if cfgDebug {
+			log.Printf("[DEBUG] SelectPage: Error on attempt %d: %v", attempt+1, err)
+		}
+
+		// If this is not the last attempt, try recovery strategies
+		if attempt < maxRetries-1 {
+			// On second attempt, try refreshing page list and using correct pageId
+			if attempt == 1 {
+				if cfgDebug {
+					log.Printf("[DEBUG] SelectPage: Attempting to refresh page list...")
+				}
+				// Use a shorter timeout for list_pages
+				listCtx, listCancel := context.WithTimeout(context.Background(), 15*time.Second)
+				pages, listErr := cdt.ListPages(listCtx)
+				listCancel()
+
+				if listErr == nil && len(pages) > 0 {
+					if cfgDebug {
+						log.Printf("[DEBUG] SelectPage: Found %d pages, looking for matching page", len(pages))
+					}
+					// Try to find a page with similar ID or the last page
+					// Use the pageId directly if it exists in the list
+					pageFound := false
+					for _, p := range pages {
+						if pid, ok := p["pageId"].(float64); ok {
+							if int(pid) == pageId {
+								pageFound = true
+								if cfgDebug {
+									log.Printf("[DEBUG] SelectPage: Found page %d in list", pageId)
+								}
+								break
+							}
+						}
+					}
+
+					// If exact page not found, use the last page (most recently opened)
+					if !pageFound && len(pages) > 0 {
+						if lastPage, ok := pages[len(pages)-1]["pageId"].(float64); ok {
+							if cfgDebug {
+								log.Printf("[DEBUG] SelectPage: Page %d not found, using last page %d instead", pageId, int(lastPage))
+							}
+							pageId = int(lastPage)
+						}
+					}
+				} else if cfgDebug {
+					log.Printf("[DEBUG] SelectPage: Failed to refresh page list: %v", listErr)
+				}
+			}
+
+			if cfgDebug {
+				log.Printf("[DEBUG] SelectPage: Retrying in %v...", retryDelay)
+			}
+			time.Sleep(retryDelay)
+			// Exponential backoff
+			retryDelay = retryDelay * 2
+			continue
+		}
+
+		return fmt.Errorf("failed after %d attempts: %w", maxRetries, err)
 	}
 
-	if cfgDebug && len(result.Content) > 0 {
-		if c, ok := result.Content[0].(mcp.TextContent); ok {
-			log.Printf("[DEBUG] SelectPage: Result: %s", c.Text)
-		}
-	}
-
-	return nil
+	return fmt.Errorf("unexpected: reached end of retry loop")
 }
 
 // ClosePage closes the specified page by its ID to free memory
